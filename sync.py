@@ -1,3 +1,18 @@
+"""
+Google Calendar -> Notion "Calendar" sync.
+Runs on GitHub Actions (free). No servers, no subscription.
+
+Reads Google Calendar "secret iCal" URLs, expands recurring events inside a
+rolling window, and upserts them into a Notion database. Rows you add by hand
+(no UID) are never touched. Any property you remove from the database (e.g.
+"Calendar" or "Type") is simply skipped, so a schema change never breaks it.
+
+Required environment variables (set as GitHub repository secrets):
+  NOTION_TOKEN  - your Notion internal integration secret
+  NOTION_DB_ID  - the Calendar database id
+  ICS_URLS      - comma-separated sources, each "Label|https://...ics"
+"""
+
 import os
 import sys
 import datetime as dt
@@ -16,9 +31,11 @@ HEADERS = {
     "Content-Type": "application/json",
 }
 
+# Rolling window: keep 1 week of history + 4 weeks ahead.
 TODAY = dt.date.today()
 WINDOW_START = TODAY - dt.timedelta(days=7)
 WINDOW_END = TODAY + dt.timedelta(days=28)
+
 VALID_CAL_LABELS = {"Personal", "ArabSoc"}
 
 
@@ -36,6 +53,18 @@ def parse_sources(raw):
     return sources
 
 
+def iso(value):
+    return value.isoformat()
+
+
+def db_property_names():
+    """Property names that currently exist on the database, so we never send a
+    property the user has since deleted (which would 400 the whole request)."""
+    r = requests.get(f"{API}/databases/{DB_ID}", headers=HEADERS)
+    r.raise_for_status()
+    return set(r.json().get("properties", {}).keys())
+
+
 def fetch_events():
     events = {}
     for label, url in parse_sources(ICS_URLS):
@@ -46,10 +75,10 @@ def fetch_events():
             for ev in recurring_ical_events.of(cal).between(WINDOW_START, WINDOW_END):
                 start = ev.get("DTSTART").dt
                 uid = str(ev.get("UID", ""))
-                key = f"{uid}|{start.isoformat()}"
+                key = f"{uid}|{iso(start)}"
                 events[key] = {
                     "summary": str(ev.get("SUMMARY") or "(no title)"),
-                    "start": start.isoformat(),
+                    "start": iso(start),
                     "location": str(ev.get("LOCATION") or ""),
                     "label": label,
                 }
@@ -78,7 +107,7 @@ def notion_existing():
     return rows
 
 
-def props_for(key, ev):
+def props_for(key, ev, valid):
     props = {
         "Session": {"title": [{"text": {"content": ev["summary"][:2000]}}]},
         "When": {"date": {"start": ev["start"]}},
@@ -87,27 +116,30 @@ def props_for(key, ev):
     }
     if ev["label"] in VALID_CAL_LABELS:
         props["Calendar"] = {"select": {"name": ev["label"]}}
-    return props
+    return {k: v for k, v in props.items() if k in valid}
 
 
 def main():
+    valid = db_property_names()
     events = fetch_events()
     existing = notion_existing()
     seen = set()
+
     for key, ev in events.items():
         seen.add(key)
-        body = {"properties": props_for(key, ev)}
+        body = {"properties": props_for(key, ev, valid)}
         if key in existing:
             requests.patch(f"{API}/pages/{existing[key]}", headers=HEADERS, json=body).raise_for_status()
         else:
             body["parent"] = {"database_id": DB_ID}
             requests.post(f"{API}/pages", headers=HEADERS, json=body).raise_for_status()
+
     for key, page_id in existing.items():
         if key not in seen:
             requests.patch(f"{API}/pages/{page_id}", headers=HEADERS, json={"archived": True}).raise_for_status()
-    print(f"Synced {len(events)} events.")
+
+    print(f"Synced {len(events)} events; cleaned {len(existing) - len(seen & set(existing))} stale rows.")
 
 
 if __name__ == "__main__":
     main()
-
